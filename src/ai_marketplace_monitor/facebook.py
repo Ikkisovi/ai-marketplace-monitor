@@ -10,16 +10,19 @@ from urllib.parse import quote
 
 import humanize
 from currency_converter import CurrencyConverter  # type: ignore
-from playwright.sync_api import Browser, ElementHandle, Page  # type: ignore
+from playwright.sync_api import Browser, ElementHandle, Locator, Page  # type: ignore
 from rich.pretty import pretty_repr
 
 from .listing import Listing
+from .market_data import get_market_data_store
 from .marketplace import ItemConfig, Marketplace, MarketplaceConfig, WebPage
 from .utils import (
     BaseConfig,
+    CacheType,
     CounterItem,
     KeyboardMonitor,
     Translator,
+    cache,
     convert_to_seconds,
     counter,
     doze,
@@ -78,6 +81,32 @@ class Category(Enum):
     VIDEO_GAMES = "videogames"
 
 
+def _infer_market_status(*texts: str) -> str:
+    combined = " ".join((text or "") for text in texts).lower()
+    pending_patterns = (
+        r"\bpending\b",
+        r"\bon hold\b",
+        r"\breserved\b",
+        r"待定",
+        r"保留",
+    )
+    if any(re.search(pattern, combined, re.IGNORECASE) for pattern in pending_patterns):
+        return "pending"
+
+    sold_patterns = (
+        r"\bsold\b",
+        r"已售",
+        r"售出",
+        r"\bvendu\b",
+        r"\bvendido\b",
+        r"\bverkauft\b",
+    )
+    if any(re.search(pattern, combined, re.IGNORECASE) for pattern in sold_patterns):
+        return "sold"
+
+    return "unknown"
+
+
 @dataclass
 class FacebookMarketItemCommonConfig(BaseConfig):
     """Item options that can be defined in marketplace
@@ -92,6 +121,11 @@ class FacebookMarketItemCommonConfig(BaseConfig):
     date_listed: List[int] | None = None
     delivery_method: List[str] | None = None
     category: str | None = None
+    collect_sold: bool | None = None
+    market_price_window_days: int | None = None
+    auto_send_message: bool | None = None
+    message_preset: str | None = None
+    message_send_delay: int | None = None
 
     def handle_seller_locations(self: "FacebookMarketItemCommonConfig") -> None:
         if self.seller_locations is None:
@@ -199,6 +233,54 @@ class FacebookMarketItemCommonConfig(BaseConfig):
                 f"Item {hilight(self.name)} category must be one of {', '.join(x.value for x in Category)}."
             )
 
+    def handle_collect_sold(self: "FacebookMarketItemCommonConfig") -> None:
+        if self.collect_sold is None:
+            return
+        if not isinstance(self.collect_sold, bool):
+            raise ValueError(f"Item {hilight(self.name)} collect_sold must be a boolean.")
+
+    def handle_market_price_window_days(self: "FacebookMarketItemCommonConfig") -> None:
+        if self.market_price_window_days is None:
+            return
+        if (
+            not isinstance(self.market_price_window_days, int)
+            or self.market_price_window_days < 1
+        ):
+            raise ValueError(
+                f"Item {hilight(self.name)} market_price_window_days must be a positive integer."
+            )
+
+    def handle_auto_send_message(self: "FacebookMarketItemCommonConfig") -> None:
+        if self.auto_send_message is None:
+            return
+        if not isinstance(self.auto_send_message, bool):
+            raise ValueError(f"Item {hilight(self.name)} auto_send_message must be a boolean.")
+
+    def handle_message_preset(self: "FacebookMarketItemCommonConfig") -> None:
+        if self.message_preset is None:
+            return
+        if not isinstance(self.message_preset, str):
+            raise ValueError(f"Item {hilight(self.name)} message_preset must be a string.")
+        if len(self.message_preset.strip()) == 0:
+            raise ValueError(f"Item {hilight(self.name)} message_preset cannot be empty.")
+
+    def handle_message_send_delay(self: "FacebookMarketItemCommonConfig") -> None:
+        if self.message_send_delay is None:
+            return
+        if isinstance(self.message_send_delay, str):
+            try:
+                self.message_send_delay = convert_to_seconds(self.message_send_delay)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                raise ValueError(
+                    f"Item {hilight(self.name)} message_send_delay {self.message_send_delay} is not recognized."
+                ) from e
+        if not isinstance(self.message_send_delay, int) or self.message_send_delay < 0:
+            raise ValueError(
+                f"Item {hilight(self.name)} message_send_delay must be a non-negative integer."
+            )
+
 
 @dataclass
 class FacebookMarketplaceConfig(MarketplaceConfig, FacebookMarketItemCommonConfig):
@@ -273,6 +355,183 @@ class FacebookMarketplace(Marketplace):
     def get_item_config(cls: Type["FacebookMarketplace"], **kwargs: Any) -> FacebookItemConfig:
         return FacebookItemConfig(**kwargs)
 
+    @staticmethod
+    def _sent_message_cache_key(listing_id: str) -> tuple[str, str, str]:
+        return (CacheType.SENT_MESSAGES.value, "facebook", listing_id)
+
+    def was_message_sent(self: "FacebookMarketplace", listing_id: str) -> bool:
+        return cache.get(self._sent_message_cache_key(listing_id)) is not None
+
+    def mark_message_sent(self: "FacebookMarketplace", listing: Listing, message: str | None) -> None:
+        cache.set(
+            self._sent_message_cache_key(listing.id),
+            {
+                "id": listing.id,
+                "url": listing.post_url.split("?")[0],
+                "price": listing.price,
+                "title": listing.title,
+                "sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "message": message,
+            },
+            tag=CacheType.SENT_MESSAGES.value,
+        )
+
+    def send_preset_message(
+        self: "FacebookMarketplace",
+        listing: Listing,
+        preset_message: str | None = None,
+        send_delay_seconds: int = 2,
+    ) -> bool:
+        if not self.page:
+            self.login()
+        assert self.page is not None
+
+        try:
+            self.goto_url(listing.post_url)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"""{hilight("[Message]", "fail")} Failed to open listing {listing.post_url}: {e}"""
+                )
+            return False
+
+        def _first_visible(locator: Locator) -> Locator | None:
+            try:
+                count = locator.count()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                return None
+            for idx in range(count):
+                try:
+                    candidate = locator.nth(idx)
+                    if candidate.is_visible():
+                        return candidate
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    continue
+            return None
+
+        composer_candidates = [
+            self.page.locator("textarea"),
+            self.page.get_by_role("textbox", name=re.compile(r"message", re.IGNORECASE)),
+            self.page.locator("[contenteditable='true'][role='textbox']"),
+        ]
+
+        send_candidates = [
+            self.page.locator(
+                "[role='button'][aria-label*='Send message to'], [role='button'][aria-label*='发送消息给']"
+            ),
+            self.page.get_by_role(
+                "button", name=re.compile(r"(send|发送)", re.IGNORECASE)
+            ),
+            self.page.locator("button:has-text('Send')"),
+            self.page.locator("[role='button']:has-text('Send')"),
+            self.page.locator("button:has-text('发送')"),
+            self.page.locator("[role='button']:has-text('发送')"),
+            self.page.locator("input[type='submit']"),
+        ]
+
+        def _find_visible_composer() -> Locator | None:
+            for candidate in composer_candidates:
+                visible_composer = _first_visible(candidate)
+                if visible_composer is not None:
+                    return visible_composer
+            return None
+
+        def _find_visible_send_button() -> Locator | None:
+            for candidate in send_candidates:
+                visible_send = _first_visible(candidate)
+                if visible_send is not None:
+                    return visible_send
+            return None
+
+        composer = _find_visible_composer()
+        send_button = _find_visible_send_button()
+
+        if send_button is None:
+            if self.logger:
+                self.logger.debug(
+                    f"""{hilight("[Message]", "info")} Direct Send button not visible for {listing.id}; trying Message button fallback."""
+                )
+
+            # Fallback path: open composer via Message button first.
+            message_button_patterns = (
+                r"^Message$",
+                r"^Message seller$",
+                r"^Send seller a message$",
+                r"^发消息$",
+                r"^联系卖家$",
+            )
+            for pattern in message_button_patterns:
+                btn = self.page.get_by_role("button", name=re.compile(pattern, re.IGNORECASE))
+                visible_button = _first_visible(btn)
+                if visible_button is None:
+                    continue
+                try:
+                    visible_button.click()
+                    break
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    continue
+
+            # The message pane can render asynchronously after clicking Message.
+            for _ in range(5):
+                composer = _find_visible_composer() or composer
+                send_button = _find_visible_send_button()
+                if send_button is not None:
+                    break
+                time.sleep(1)
+        elif self.logger:
+            self.logger.debug(
+                f"""{hilight("[Message]", "info")} Found direct Send button for {listing.id}; skipping Message button click."""
+            )
+
+        if preset_message and composer is not None:
+            try:
+                composer.click()
+                # Prefer fill for textarea; fallback to keyboard typing for contenteditable composer.
+                try:
+                    composer.fill(preset_message)
+                except Exception:
+                    self.page.keyboard.press("Control+A")
+                    self.page.keyboard.type(preset_message, delay=20)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                if self.logger:
+                    self.logger.debug(
+                        f"""{hilight("[Message]", "fail")} Failed to set message for listing {listing.id}: {e}"""
+                    )
+
+        if send_button is None:
+            if self.logger:
+                self.logger.debug(
+                    f"""{hilight("[Message]", "fail")} No visible Send button found for listing {listing.id}."""
+                )
+            return False
+
+        try:
+            send_button.click()
+            time.sleep(max(0, send_delay_seconds))
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Message]", "succ")} Sent preset message for {hilight(listing.title)} ({listing.post_url.split('?')[0]})."""
+                )
+            return True
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if self.logger:
+                self.logger.error(
+                    f"""{hilight("[Message]", "fail")} Failed to click Send for listing {listing.id}: {e}"""
+                )
+            return False
+
     def login(self: "FacebookMarketplace") -> None:
         assert self.browser is not None
 
@@ -320,9 +579,28 @@ class FacebookMarketplace(Marketplace):
                     selector.type(self.config.password, delay=250)
             if self.config.username and self.config.password:
                 time.sleep(2)
-                selector = self.page.wait_for_selector('button[name="login"]')
-                if selector is not None:
-                    selector.click()
+                clicked_login = False
+                login_candidates = [
+                    self.page.locator('button[name="login"]'),
+                    self.page.get_by_role(
+                        "button", name=re.compile(r"(log in|login|登录|登入)", re.IGNORECASE)
+                    ),
+                    self.page.locator("input[type='submit']"),
+                ]
+                for candidate in login_candidates:
+                    try:
+                        if candidate.count() > 0 and candidate.first.is_visible():
+                            candidate.first.click()
+                            clicked_login = True
+                            break
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        continue
+                if not clicked_login and self.logger:
+                    self.logger.error(
+                        f"""{hilight("[Login]", "fail")} Failed to find a visible login submit button."""
+                    )
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -352,48 +630,41 @@ class FacebookMarketplace(Marketplace):
             self.login()
             assert self.page is not None
 
-        options = []
+        search_idx = 0 if item_config.searched_count == 0 else -1
 
         condition = item_config.condition or self.config.condition
-        if condition:
-            options.append(f"itemCondition={'%2C'.join(condition)}")
 
-        # availability can take values from item_config, or marketplace config and will
-        # use the first or second value depending on how many times the item has been searched.
+        # date_listed can take values from item_config or marketplace config.
         if item_config.date_listed:
-            date_listed = item_config.date_listed[0 if item_config.searched_count == 0 else -1]
+            date_listed = item_config.date_listed[search_idx]
         elif self.config.date_listed:
-            date_listed = self.config.date_listed[0 if item_config.searched_count == 0 else -1]
+            date_listed = self.config.date_listed[search_idx]
         else:
             date_listed = DateListed.ANYTIME.value
-        if date_listed is not None and date_listed != DateListed.ANYTIME.value:
-            options.append(f"daysSinceListed={date_listed}")
 
-        # delivery_method can take values from item_config, or marketplace config and will
-        # use the first or second value depending on how many times the item has been searched.
+        # delivery_method can take values from item_config or marketplace config.
         if item_config.delivery_method:
-            delivery_method = item_config.delivery_method[
-                0 if item_config.searched_count == 0 else -1
-            ]
+            delivery_method = item_config.delivery_method[search_idx]
         elif self.config.delivery_method:
-            delivery_method = self.config.delivery_method[
-                0 if item_config.searched_count == 0 else -1
-            ]
+            delivery_method = self.config.delivery_method[search_idx]
         else:
             delivery_method = DeliveryMethod.ALL.value
-        if delivery_method is not None and delivery_method != DeliveryMethod.ALL.value:
-            options.append(f"deliveryMethod={delivery_method}")
 
-        # availability can take values from item_config, or marketplace config and will
-        # use the first or second value depending on how many times the item has been searched.
         if item_config.availability:
-            availability = item_config.availability[0 if item_config.searched_count == 0 else -1]
+            default_availability = item_config.availability[search_idx]
         elif self.config.availability:
-            availability = self.config.availability[0 if item_config.searched_count == 0 else -1]
+            default_availability = self.config.availability[search_idx]
         else:
-            availability = Availability.ALL.value
-        if availability is not None and availability != Availability.ALL.value:
-            options.append(f"availability={availability}")
+            default_availability = Availability.ALL.value
+
+        collect_sold = (
+            item_config.collect_sold
+            if item_config.collect_sold is not None
+            else bool(self.config.collect_sold)
+        )
+        availability_modes = [default_availability]
+        if collect_sold and Availability.OUTSTOCK.value not in availability_modes:
+            availability_modes.append(Availability.OUTSTOCK.value)
 
         # search multiple keywords and cities
         # there is a small chance that search by different keywords and city will return the same items.
@@ -411,6 +682,34 @@ class FacebookMarketplace(Marketplace):
                 )
         # increase the searched_count to differentiate first and subsequent searches
         item_config.searched_count += 1
+
+        market_data_store = get_market_data_store()
+        market_window_days = (
+            item_config.market_price_window_days
+            if item_config.market_price_window_days is not None
+            else self.config.market_price_window_days or 30
+        )
+        auto_send_message = (
+            item_config.auto_send_message
+            if item_config.auto_send_message is not None
+            else bool(getattr(self.config, "auto_send_message", False))
+        )
+        message_preset = (
+            item_config.message_preset
+            if item_config.message_preset is not None
+            else getattr(self.config, "message_preset", None)
+        )
+        config_message_delay = getattr(self.config, "message_send_delay", None)
+        message_send_delay = (
+            item_config.message_send_delay
+            if item_config.message_send_delay is not None
+            else (config_message_delay if config_message_delay is not None else 2)
+        )
+        seen_non_out_ids: set[str] = set()
+        availability_query_value = {
+            Availability.INSTOCK.value: "in stock",
+            Availability.OUTSTOCK.value: "out of stock",
+        }
         for city, cname, radius, currency in zip(
             search_city,
             repeat(None) if city_name is None else city_name,
@@ -418,133 +717,263 @@ class FacebookMarketplace(Marketplace):
             repeat(None) if currencies is None else currencies,
         ):
             marketplace_url = f"https://www.facebook.com/marketplace/{city}/search?"
+            for availability in availability_modes:
+                is_sold_mode = availability == Availability.OUTSTOCK.value
+                options: list[str] = []
 
-            if radius:
-                # avoid specifying radius more than once
-                if options and options[-1].startswith("radius"):
-                    options.pop()
-                options.append(f"radius={radius}")
+                if date_listed is not None and date_listed != DateListed.ANYTIME.value:
+                    options.append(f"daysSinceListed={date_listed}")
 
-            max_price = item_config.max_price or self.config.max_price
-            if max_price:
-                if max_price.isdigit():
-                    options.append(f"maxPrice={max_price}")
-                else:
-                    price, cur = max_price.split(" ", 1)
-                    if currency and cur != currency:
-                        c = CurrencyConverter()
-                        price = str(int(c.convert(int(price), cur, currency)))
-                        if self.logger:
-                            self.logger.debug(
-                                f"""{hilight("[Search]", "info")} Converting price {max_price} {cur} to {price} {currency}"""
-                            )
-                    options.append(f"maxPrice={price}")
+                if availability is not None and availability != Availability.ALL.value:
+                    availability_value = availability_query_value.get(availability, availability)
+                    options.append(f"availability={quote(availability_value)}")
 
-            min_price = item_config.min_price or self.config.min_price
-            if min_price:
-                if min_price.isdigit():
-                    options.append(f"minPrice={min_price}")
-                else:
-                    price, cur = min_price.split(" ", 1)
-                    if currency and cur != currency:
-                        c = CurrencyConverter()
-                        price = str(int(c.convert(int(price), cur, currency)))
-                        if self.logger:
-                            self.logger.debug(
-                                f"""{hilight("[Search]", "info")} Converting price {max_price} {cur} to {price} {currency}"""
-                            )
-                    options.append(f"minPrice={price}")
+                # Sold lookups are a dedicated broad pass; keep only query/date/availability
+                # to avoid false constraints from price/category/delivery filters.
+                if not is_sold_mode:
+                    if radius:
+                        options.append(f"radius={radius}")
 
-            category = item_config.category or self.config.category
-            if category:
-                options.append(f"category={category}")
-                if category == Category.FREE_STUFF.value or category == Category.FREE.value:
-                    # find min_price= and max_price= in options and remove them
-                    options = [
-                        x
-                        for x in options
-                        if not x.startswith("minPrice=") and not x.startswith("maxPrice=")
-                    ]
+                    if condition:
+                        options.append(f"itemCondition={'%2C'.join(condition)}")
 
-            for search_phrase in item_config.search_phrases:
-                if self.logger:
-                    self.logger.info(
-                        f"""{hilight("[Search]", "info")} Searching {item_config.marketplace} for """
-                        f"""{hilight(item_config.name)} from {hilight(cname or city)}"""
-                        + (f" with radius={radius}" if radius else " with default radius")
-                    )
+                    if delivery_method is not None and delivery_method != DeliveryMethod.ALL.value:
+                        options.append(f"deliveryMethod={delivery_method}")
 
-                self.goto_url(
-                    marketplace_url + "&".join([f"query={quote(search_phrase)}", *options])
-                )
+                    max_price = item_config.max_price or self.config.max_price
+                    if max_price:
+                        if max_price.isdigit():
+                            options.append(f"maxPrice={max_price}")
+                        else:
+                            price, cur = max_price.split(" ", 1)
+                            if currency and cur != currency:
+                                c = CurrencyConverter()
+                                price = str(int(c.convert(int(price), cur, currency)))
+                                if self.logger:
+                                    self.logger.debug(
+                                        f"""{hilight("[Search]", "info")} Converting price {max_price} {cur} to {price} {currency}"""
+                                    )
+                            options.append(f"maxPrice={price}")
 
-                found_listings = FacebookSearchResultPage(
-                    self.page, self.translator, self.logger
-                ).get_listings()
-                time.sleep(5)
-                if self.logger:
-                    self.logger.error(
-                        f"""{hilight("[Search]", "fail")} Failed to get search results for {search_phrase} from {city}"""
-                    )
+                    min_price = item_config.min_price or self.config.min_price
+                    if min_price:
+                        if min_price.isdigit():
+                            options.append(f"minPrice={min_price}")
+                        else:
+                            price, cur = min_price.split(" ", 1)
+                            if currency and cur != currency:
+                                c = CurrencyConverter()
+                                price = str(int(c.convert(int(price), cur, currency)))
+                                if self.logger:
+                                    self.logger.debug(
+                                        f"""{hilight("[Search]", "info")} Converting price {min_price} {cur} to {price} {currency}"""
+                                    )
+                            options.append(f"minPrice={price}")
 
-                counter.increment(CounterItem.SEARCH_PERFORMED, item_config.name)
+                    category = item_config.category or self.config.category
+                    if category:
+                        options.append(f"category={category}")
+                        if category in (Category.FREE_STUFF.value, Category.FREE.value):
+                            options = [
+                                x
+                                for x in options
+                                if not x.startswith("minPrice=") and not x.startswith("maxPrice=")
+                            ]
 
-                # go to each item and get the description
-                # if we have not done that before
-                for listing in found_listings:
-                    if listing.post_url.split("?")[0] in found:
-                        continue
-                    if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
-                        return
-                    counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
-                    found[listing.post_url.split("?")[0]] = True
-                    # filter by title and location; skip keyword filtering since we do not have description yet.
-                    if not self.check_listing(listing, item_config, description_available=False):
-                        counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
-                        continue
-                    try:
-                        details, from_cache = self.get_listing_details(
-                            listing.post_url,
-                            item_config,
-                            price=listing.price,
-                            title=listing.title,
-                        )
-                        if not from_cache:
-                            time.sleep(5)
-                    except KeyboardInterrupt:
-                        raise
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.error(
-                                f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
-                            )
-                        continue
-                    # currently we trust the other items from summary page a bit better
-                    # so we do not copy title, description etc from the detailed result
-                    for attr in ("condition", "seller", "description"):
-                        # other attributes should be consistent
-                        setattr(listing, attr, getattr(details, attr))
-                    listing.name = item_config.name
+                for search_phrase in item_config.search_phrases:
                     if self.logger:
-                        self.logger.debug(
-                            f"""{hilight("[Retrieve]", "succ")} New item "{listing.title}" from {listing.post_url} is sold by "{listing.seller}" and with description "{listing.description[:100]}..." """
+                        if is_sold_mode:
+                            self.logger.info(
+                                f"""{hilight("[Search]", "info")} Searching {item_config.marketplace} for """
+                                f"""{hilight(item_config.name)} from {hilight(cname or city)}"""
+                                + f", availability={availability} (sold broad pass)"
+                            )
+                        else:
+                            self.logger.info(
+                                f"""{hilight("[Search]", "info")} Searching {item_config.marketplace} for """
+                                f"""{hilight(item_config.name)} from {hilight(cname or city)}"""
+                                + (f" with radius={radius}" if radius else " with default radius")
+                                + (
+                                    f", availability={availability}"
+                                    if availability != Availability.ALL.value
+                                    else ""
+                                )
+                            )
+
+                    self.goto_url(
+                        marketplace_url
+                        + "&".join([f"query={quote(search_phrase)}", "exact=false", *options])
+                    )
+
+                    found_listings = FacebookSearchResultPage(
+                        self.page, self.translator, self.logger
+                    ).get_listings()
+                    time.sleep(5)
+
+                    counter.increment(CounterItem.SEARCH_PERFORMED, item_config.name)
+                    sold_records = 0
+
+                    # go to each item and get the description if we have not done that before
+                    for listing in found_listings:
+                        # When Facebook returns mixed results for the sold filter, prevent false sold
+                        # observations by honoring in-stock sightings from this same search pass.
+                        if availability != Availability.OUTSTOCK.value:
+                            seen_non_out_ids.add(listing.id)
+                        elif listing.id in seen_non_out_ids:
+                            if self.logger:
+                                self.logger.debug(
+                                    f"""{hilight("[Data]", "info")} Skip sold observation for {listing.id} because it also appeared in non-sold results."""
+                                )
+                            continue
+
+                        cache_key = f"{availability}:{listing.post_url.split('?')[0]}"
+                        if cache_key in found:
+                            continue
+                        if self.keyboard_monitor is not None and self.keyboard_monitor.is_paused():
+                            return
+                        counter.increment(CounterItem.LISTING_EXAMINED, item_config.name)
+                        found[cache_key] = True
+                        # filter by title and location; skip keyword filtering since we do not have description yet.
+                        if not self.check_listing(listing, item_config, description_available=False):
+                            counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+                            continue
+                        details = market_data_store.get_latest_listing_snapshot(
+                            listing.marketplace, listing.id
+                        )
+                        if details is None:
+                            try:
+                                details, from_cache = self.get_listing_details(
+                                    listing.post_url,
+                                    item_config,
+                                    price=listing.price,
+                                    title=listing.title,
+                                )
+                                if not from_cache:
+                                    time.sleep(5)
+                            except KeyboardInterrupt:
+                                raise
+                            except Exception as e:
+                                if self.logger:
+                                    self.logger.error(
+                                        f"""{hilight("[Retrieve]", "fail")} Failed to get item details: {e}"""
+                                    )
+                                continue
+                        elif self.logger:
+                            self.logger.debug(
+                                f"""{hilight("[Retrieve]", "info")} Reusing cached snapshot for listing {listing.id}; skipping detail-page navigation."""
+                            )
+
+                        # currently we trust the summary title and price more than detailed page.
+                        for attr in ("condition", "seller", "description"):
+                            setattr(listing, attr, getattr(details, attr))
+                        listing.name = item_config.name
+
+                        if self.logger:
+                            self.logger.debug(
+                                f"""{hilight("[Retrieve]", "succ")} New item "{listing.title}" from {listing.post_url} is sold by "{listing.seller}" and with description "{listing.description[:100]}..." """
+                            )
+
+                        # Warn if we never managed to extract a description for keyword-based filtering
+                        if (
+                            (not listing.description or len(listing.description.strip()) == 0)
+                            and item_config.keywords
+                            and len(item_config.keywords) > 0
+                            and self.logger
+                        ):
+                            self.logger.debug(
+                                f"""{hilight("[Error]", "fail")} Failed to extract description for {hilight(listing.title)} at {listing.post_url}. Keyword filtering will only apply to title."""
+                            )
+
+                        # Apply full filtering before persistence to avoid storing skipped listings.
+                        if not self.check_listing(listing, item_config):
+                            counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+                            continue
+
+                        if availability == Availability.OUTSTOCK.value:
+                            market_status = _infer_market_status(
+                                str(getattr(listing, "market_status", "")),
+                                listing.title,
+                                listing.description,
+                                getattr(details, "title", ""),
+                            )
+                            if market_status != "sold":
+                                if self.logger:
+                                    self.logger.debug(
+                                        f"""{hilight("[Data]", "info")} Skip out-of-stock observation for {listing.id}; inferred status={market_status} (no explicit sold marker)."""
+                                    )
+                                continue
+
+                        was_seen_out = market_data_store.has_observation(
+                            listing.marketplace, listing.id, availability=Availability.OUTSTOCK.value
+                        )
+                        was_seen_non_out = market_data_store.has_non_out_observation(
+                            listing.marketplace, listing.id
                         )
 
-                    # Warn if we never managed to extract a description for keyword-based filtering
-                    if (
-                        (not listing.description or len(listing.description.strip()) == 0)
-                        and item_config.keywords
-                        and len(item_config.keywords) > 0
-                        and self.logger
-                    ):
-                        self.logger.debug(
-                            f"""{hilight("[Error]", "fail")} Failed to extract description for {hilight(listing.title)} at {listing.post_url}. Keyword filtering will only apply to title."""
-                        )
+                        try:
+                            market_data_store.record_observation(
+                                listing=listing,
+                                item_name=item_config.name,
+                                search_city=city,
+                                search_phrase=search_phrase,
+                                availability=availability,
+                            )
+                            if availability == Availability.OUTSTOCK.value:
+                                sold_records += 1
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.debug(
+                                    f"""{hilight("[Data]", "fail")} Failed to persist listing {listing.id}: {e}"""
+                                )
 
-                    if self.check_listing(listing, item_config):
+                        # sold listings are kept in market_data table and are not yielded for notifications.
+                        if availability == Availability.OUTSTOCK.value:
+                            if (not was_seen_out) and was_seen_non_out and self.logger:
+                                self.logger.info(
+                                    f"""{hilight("[Sold]", "info")} {hilight(listing.title)} appears sold at {hilight(listing.price)} ({listing.post_url.split('?')[0]})."""
+                                )
+                            continue
+
+                        if auto_send_message:
+                            if self.was_message_sent(listing.id):
+                                if self.logger:
+                                    self.logger.debug(
+                                        f"""{hilight("[Message]", "info")} Skip messaging listing {listing.id}; preset message already sent before."""
+                                    )
+                            else:
+                                sent = self.send_preset_message(
+                                    listing=listing,
+                                    preset_message=message_preset,
+                                    send_delay_seconds=message_send_delay,
+                                )
+                                if sent:
+                                    self.mark_message_sent(listing, message_preset)
+
                         yield listing
-                    else:
-                        counter.increment(CounterItem.EXCLUDED_LISTING, item_config.name)
+
+                    if availability == Availability.OUTSTOCK.value and sold_records > 0:
+                        try:
+                            sample_size, msrp_estimate, msrp_currency = (
+                                market_data_store.refresh_market_price(
+                                    item_name=item_config.name,
+                                    marketplace="facebook",
+                                    search_city=city,
+                                    window_days=market_window_days,
+                                )
+                            )
+                            if self.logger and msrp_estimate is not None:
+                                self.logger.info(
+                                    f"""{hilight("[Market]", "info")} {item_config.name} {city} sold sample={sample_size}, msrp_estimate={msrp_estimate:.2f}{f" {msrp_currency}" if msrp_currency else ""} (window={market_window_days}d)"""
+                                )
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            if self.logger:
+                                self.logger.debug(
+                                    f"""{hilight("[Data]", "fail")} Failed to refresh market price for {item_config.name}: {e}"""
+                                )
 
     def get_listing_details(
         self: "FacebookMarketplace",
@@ -756,24 +1185,25 @@ class FacebookSearchResultPage(WebPage):
                 if image.startswith("/"):
                     image = f"https://www.facebook.com{image}"
 
-                listings.append(
-                    Listing(
-                        marketplace="facebook",
-                        name="",
-                        id=post_url.split("?")[0].rstrip("/").split("/")[-1],
-                        title=title,
-                        image=image,
-                        price=price,
-                        # all the ?referral_code&referral_sotry_type etc
-                        # could be helpful for live navigation, but will be stripped
-                        # for caching item details.
-                        post_url=post_url,
-                        location=location,
-                        condition="",
-                        seller="",
-                        description="",
-                    )
+                listing_obj = Listing(
+                    marketplace="facebook",
+                    name="",
+                    id=post_url.split("?")[0].rstrip("/").split("/")[-1],
+                    title=title,
+                    image=image,
+                    price=price,
+                    # all the ?referral_code&referral_sotry_type etc
+                    # could be helpful for live navigation, but will be stripped
+                    # for caching item details.
+                    post_url=post_url,
+                    location=location,
+                    condition="",
+                    seller="",
+                    description="",
                 )
+                # Sold/pending labels often appear in summary text (e.g. "Sold · ...").
+                listing_obj.market_status = _infer_market_status(raw_price, title, location)
+                listings.append(listing_obj)
             except KeyboardInterrupt:
                 raise
             except Exception as e:

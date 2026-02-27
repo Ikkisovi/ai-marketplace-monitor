@@ -1,0 +1,47 @@
+[marketplace.facebook]
+search_city = "vancouver"
+# Optional: set credentials via environment variables for auto-login.
+# username = "${FACEBOOK_USERNAME}"
+# password = "${FACEBOOK_PASSWORD}"
+login_wait_time = 60
+search_interval = "30m"
+max_search_interval = "45m"
+collect_sold = true
+market_price_window_days = 30
+
+[item.sony_a7c2]
+search_phrases = [
+    "sony a7c2",
+    "sony a7cii",
+    "sony alpha 7c ii",
+]
+# First run focuses on fresh listings, subsequent runs expand back to all.
+date_listed = ["last 24 hours", "all"]
+# Keep only listings whose title/description contains "a7c".
+keywords = "a7c"
+min_price = 1
+max_price = 2000
+search_city = "vancouver"
+collect_sold = true
+market_price_window_days = 30
+ai = []
+rating = 1
+notify = "me"
+
+[item.olympus_film]
+search_phrases = [
+    "olympus film",
+    "olympus camera",
+]
+# Require Olympus + film keyword (including common typo "flim").
+keywords = "olympus AND (film OR flim)"
+date_listed = ["last 24 hours", "all"]
+search_city = "vancouver"
+collect_sold = true
+market_price_window_days = 30
+ai = []
+rating = 1
+notify = "me"
+
+[user.me]
+enabled = true

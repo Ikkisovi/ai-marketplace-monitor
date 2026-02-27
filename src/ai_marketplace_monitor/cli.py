@@ -38,7 +38,11 @@ def main(
         typer.Option(
             "-r",
             "--config",
-            help="Path to one or more configuration files in TOML format. `~/.ai-marketplace-monitor/config.toml will always be read.",
+            help=(
+                "Path to one or more configuration files in TOML format. "
+                f"`{amm_home / 'config.toml'}` will always be read. "
+                "Set AIMM_HOME to override this location."
+            ),
         ),
     ] = None,
     headless: Annotated[

@@ -135,3 +135,7 @@ dmypy.json
 
 # Code editors
 .vscode
+
+# Local runtime outputs and symlinked data store
+runtime-data
+runtime-data/

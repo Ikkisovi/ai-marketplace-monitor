@@ -1,0 +1,26 @@
+[marketplace.facebook]
+search_city = "vancouver"
+city_name = "Vancouver, BC"
+currency = "CAD"
+login_wait_time = 30
+username = "${FACEBOOK_USERNAME}"
+password = "${FACEBOOK_PASSWORD}"
+auto_send_message = true
+message_preset = "Hello, is this still available?"
+message_send_delay = 2
+search_interval = "30m"
+max_search_interval = "45m"
+
+[item.fb_send_test]
+marketplace = "facebook"
+search_phrases = ["sony a7c2"]
+search_city = "vancouver"
+ai = []
+rating = 1
+notify = "me"
+auto_send_message = true
+message_preset = "Hello, is this still available?"
+message_send_delay = 2
+
+[user.me]
+enabled = true

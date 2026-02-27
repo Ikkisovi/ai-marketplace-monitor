@@ -44,8 +44,37 @@ from PIL import Image
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+AIMM_HOME_ENV = "AIMM_HOME"
+DEFAULT_AMM_HOME = Path.home() / "ai-marketplace-monitor-data"
+LEGACY_AMM_HOME = Path.home() / ".ai-marketplace-monitor"
+
+
+def _resolve_amm_home() -> Path:
+    configured_home = os.environ.get(AIMM_HOME_ENV)
+    if configured_home:
+        return Path(configured_home).expanduser().resolve()
+    return DEFAULT_AMM_HOME
+
+
+def _migrate_legacy_amm_home(target_home: Path) -> None:
+    """Move data from legacy hidden directory to the new visible default path once."""
+    # Respect user override via env var and only auto-migrate for the default location.
+    if os.environ.get(AIMM_HOME_ENV):
+        return
+    if target_home != DEFAULT_AMM_HOME:
+        return
+    if not LEGACY_AMM_HOME.exists() or target_home.exists():
+        return
+    try:
+        LEGACY_AMM_HOME.rename(target_home)
+    except OSError:
+        # Non-fatal: continue with target_home and let users migrate manually if needed.
+        return
+
+
 # home directory for all settings and caches
-amm_home = Path.home() / ".ai-marketplace-monitor"
+amm_home = _resolve_amm_home()
+_migrate_legacy_amm_home(amm_home)
 amm_home.mkdir(parents=True, exist_ok=True)
 
 cache = Cache(amm_home)
@@ -64,6 +93,7 @@ class CacheType(Enum):
     LISTING_DETAILS = "listing-details"
     AI_INQUIRY = "ai-inquiries"
     USER_NOTIFIED = "user-notifications"
+    SENT_MESSAGES = "sent-messages"
     COUNTERS = "counters"
 
 
